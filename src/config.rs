@@ -22,6 +22,7 @@ pub struct Config {
     pub switch_windows_blacklist: HashSet<String>,
     pub switch_windows_ignore_minimal: bool,
     switch_windows_only_current_desktop: Option<bool>,
+    pub switch_windows_show_preview: bool,
     pub switch_apps_enable: bool,
     pub switch_apps_hotkey: Hotkey,
     pub switch_apps_ignore_minimal: bool,
@@ -44,6 +45,7 @@ impl Default for Config {
             switch_windows_blacklist: Default::default(),
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
+            switch_windows_show_preview: true,  // Default to true to match embedded config
             switch_apps_enable: false,
             switch_apps_hotkey: Hotkey::create(SWITCH_APPS_HOTKEY_ID, "switch apps", "alt + tab")
                 .unwrap(),
@@ -102,6 +104,9 @@ impl Config {
                 .and_then(Config::to_bool)
             {
                 conf.switch_windows_only_current_desktop = Some(v);
+            }
+            if let Some(v) = section.get("show_preview").and_then(Config::to_bool) {
+                conf.switch_windows_show_preview = v;
             }
         }
         if let Some(section) = ini_conf.section(Some("switch-apps")) {

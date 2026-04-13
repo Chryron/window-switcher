@@ -1,7 +1,10 @@
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
-use crate::painter::{find_clicked_app_index, GdiAAPainter};
+use crate::painter::{
+    find_clicked_app_index, find_clicked_preview_index, find_hovered_preview_index,
+    is_close_button_clicked, GdiAAPainter, SwitchWindowsPreviewState,
+};
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
@@ -21,8 +24,8 @@ use windows::Win32::{
         LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
         SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
         HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP,
-        WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST,
+        WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     },
 };
 
@@ -34,6 +37,7 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+pub const WM_USER_SWITCH_WINDOWS_CANCEL: u32 = 6022;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -53,6 +57,7 @@ pub struct App {
     startup: Startup,
     config: Config,
     switch_windows_state: SwitchWindowsState,
+    switch_windows_preview_state: Option<SwitchWindowsPreviewState>,
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
@@ -86,6 +91,7 @@ impl App {
                 cache: None,
                 modifier_released: true,
             },
+            switch_windows_preview_state: None,
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
@@ -221,6 +227,10 @@ impl App {
             WM_USER_SWITCH_APPS => {
                 debug!("message WM_USER_SWITCH_APPS");
                 let app = get_app(hwnd)?;
+                // Clean up any existing window preview first
+                if let Some(state) = app.switch_windows_preview_state.take() {
+                    app.painter.unpaint_window_preview(state);
+                }
                 let reverse = lparam.0 == 1;
                 app.switch_apps(reverse)?;
                 if let Some(state) = &app.switch_apps_state {
@@ -241,20 +251,47 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS");
                 let app = get_app(hwnd)?;
                 let reverse = lparam.0 == 1;
-                let hwnd = app
+                // Use foreground window from WPARAM (captured at keypress time) or switch_apps_state
+                let target_hwnd = app
                     .switch_apps_state
                     .as_ref()
                     .and_then(|state| state.apps.get(state.index).map(|(_, id)| *id))
-                    .unwrap_or_else(get_foreground_window);
-                app.switch_windows(hwnd, reverse)?;
+                    .unwrap_or_else(|| {
+                        // Foreground window was captured in keyboard hook and passed via WPARAM
+                        if wparam.0 != 0 {
+                            HWND(wparam.0 as _)
+                        } else {
+                            get_foreground_window()
+                        }
+                    });
+                app.switch_windows(target_hwnd, reverse)?;
+                // Paint preview if enabled and we have a preview state
+                if app.config.switch_windows_show_preview {
+                    if let Some(state) = &mut app.switch_windows_preview_state {
+                        app.painter.paint_window_preview(state);
+                    }
+                }
             }
             WM_USER_SWITCH_WINDOWS_DONE => {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
+                // Complete window switch with preview
+                if app.config.switch_windows_show_preview {
+                    app.do_switch_window();
+                }
+            }
+            WM_USER_SWITCH_WINDOWS_CANCEL => {
+                debug!("message WM_USER_SWITCH_WINDOWS_CANCEL");
+                let app = get_app(hwnd)?;
+                app.cancel_switch_window();
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
+            }
+            WM_MOUSEMOVE => {
+                let app = get_app(hwnd)?;
+                app.handle_mouse_move();
             }
             WM_LBUTTONUP => {
                 let app = get_app(hwnd)?;
@@ -319,14 +356,38 @@ impl App {
             None => Ok(false),
             Some(windows) => {
                 let windows_len = windows.len();
+                
+                // For single window: if preview enabled, still show preview; otherwise skip
                 if windows_len == 1 {
+                    if self.config.switch_windows_show_preview {
+                        // Show preview for single window
+                        let state_windows: Vec<isize> = windows.iter().map(|(v, _)| v.0 as _).collect();
+                        let preview_windows: Vec<(HWND, String)> = windows
+                            .iter()
+                            .map(|(h, t)| (*h, t.clone()))
+                            .collect();
+                        
+                        self.switch_windows_state = SwitchWindowsState {
+                            cache: Some((module_path.clone(), windows[0].0, 0, state_windows)),
+                            modifier_released: false,
+                        };
+                        // IMPORTANT: Clean up old thumbnails before creating new state (without hiding window)
+                        if let Some(old_state) = self.switch_windows_preview_state.take() {
+                            self.painter.cleanup_thumbnails_only(old_state);
+                        }
+                        self.switch_windows_preview_state =
+                            Some(SwitchWindowsPreviewState::new(preview_windows, 0));
+                        return Ok(true);
+                    }
                     return Ok(false);
                 }
+                
                 let current_id = windows[0].0;
                 let mut index = 1;
                 let mut state_id = current_id;
                 let mut state_windows = vec![];
-                if windows_len > 2 {
+                // Changed from > 2 to >= 2 to allow cycling with 2 windows
+                if windows_len >= 2 {
                     if let Some((cache_module_path, cache_id, cache_index, cache_windows)) =
                         self.switch_windows_state.cache.as_ref()
                     {
@@ -368,15 +429,56 @@ impl App {
                 if state_windows.is_empty() {
                     state_windows = windows.iter().map(|(v, _)| v.0 as _).collect();
                 }
-                let hwnd = HWND(state_windows[index] as _);
+                let target_hwnd = HWND(state_windows[index] as _);
                 self.switch_windows_state = SwitchWindowsState {
-                    cache: Some((module_path.clone(), state_id, index, state_windows)),
+                    cache: Some((module_path.clone(), state_id, index, state_windows.clone())),
                     modifier_released: false,
                 };
-                set_foreground_window(hwnd);
+
+                // If preview mode is enabled, update the preview state instead of switching immediately
+                if self.config.switch_windows_show_preview {
+                    // Build window list with titles for preview
+                    let preview_windows: Vec<(HWND, String)> = state_windows
+                        .iter()
+                        .map(|id| {
+                            let h = HWND(*id as _);
+                            let title = windows
+                                .iter()
+                                .find(|(w, _)| w.0 as isize == *id)
+                                .map(|(_, t)| t.clone())
+                                .unwrap_or_default();
+                            (h, title)
+                        })
+                        .collect();
+                    
+                    // IMPORTANT: Clean up old thumbnails before creating new state (without hiding window)
+                    if let Some(old_state) = self.switch_windows_preview_state.take() {
+                        self.painter.cleanup_thumbnails_only(old_state);
+                    }
+                    self.switch_windows_preview_state =
+                        Some(SwitchWindowsPreviewState::new(preview_windows, index));
+                } else {
+                    // Original behavior: switch immediately
+                    set_foreground_window(target_hwnd);
+                }
 
                 Ok(true)
             }
+        }
+    }
+
+    fn do_switch_window(&mut self) {
+        if let Some(state) = self.switch_windows_preview_state.take() {
+            if let Some((hwnd, _)) = state.windows.get(state.index) {
+                set_foreground_window(*hwnd);
+            }
+            self.painter.unpaint_window_preview(state);
+        }
+    }
+
+    fn cancel_switch_window(&mut self) {
+        if let Some(state) = self.switch_windows_preview_state.take() {
+            self.painter.unpaint_window_preview(state);
         }
     }
 
@@ -444,6 +546,21 @@ impl App {
     }
 
     fn click(&mut self) {
+        // Check window preview first
+        if let Some(state) = self.switch_windows_preview_state.as_mut() {
+            if let Some(i) = find_clicked_preview_index(state) {
+                // Check if close button was clicked
+                if is_close_button_clicked(state, i) {
+                    self.close_preview_window(i);
+                    return;
+                }
+                // Otherwise switch to clicked window
+                state.index = i;
+                self.do_switch_window();
+                return;
+            }
+        }
+        // Then check app switcher
         if let Some(state) = self.switch_apps_state.as_mut() {
             if let Some(i) = find_clicked_app_index(state) {
                 state.index = i;
@@ -452,7 +569,57 @@ impl App {
         }
     }
 
+    fn handle_mouse_move(&mut self) {
+        // Update hover state for window preview
+        if let Some(state) = self.switch_windows_preview_state.as_mut() {
+            let new_hovered = find_hovered_preview_index(state);
+            if new_hovered != state.hovered_index {
+                state.hovered_index = new_hovered;
+                // Repaint to show hover effect
+                self.painter.paint_window_preview(state);
+            }
+        }
+    }
+
+    fn close_preview_window(&mut self, index: usize) {
+        if let Some(state) = self.switch_windows_preview_state.as_mut() {
+            if let Some((hwnd, _)) = state.windows.get(index) {
+                let hwnd_to_close = *hwnd;
+                
+                // Send close message to the window
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+                    let _ = PostMessageW(Some(hwnd_to_close), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+
+                // Remove from the list
+                state.windows.remove(index);
+                state.thumbnail_handles.clear(); // Will be re-registered on repaint
+
+                // Adjust selection index if needed
+                if state.windows.is_empty() {
+                    // No more windows, close preview
+                    if let Some(s) = self.switch_windows_preview_state.take() {
+                        self.painter.unpaint_window_preview(s);
+                    }
+                } else {
+                    // Adjust index
+                    if state.index >= state.windows.len() {
+                        state.index = state.windows.len() - 1;
+                    }
+                    state.hovered_index = None;
+                    // Repaint
+                    self.painter.paint_window_preview(state);
+                }
+            }
+        }
+    }
+
     fn do_switch_app(&mut self) {
+        // Also clean up any lingering window preview
+        if let Some(preview_state) = self.switch_windows_preview_state.take() {
+            self.painter.unpaint_window_preview(preview_state);
+        }
         if let Some(state) = self.switch_apps_state.take() {
             if let Some((_, id)) = state.apps.get(state.index) {
                 set_foreground_window(*id);
@@ -462,6 +629,10 @@ impl App {
     }
 
     fn cancel_switch_app(&mut self) {
+        // Also clean up any lingering window preview
+        if let Some(preview_state) = self.switch_windows_preview_state.take() {
+            self.painter.unpaint_window_preview(preview_state);
+        }
         if let Some(state) = self.switch_apps_state.take() {
             self.painter.unpaint(state);
         }

@@ -1,7 +1,7 @@
 use crate::{
     app::{
         WM_USER_SWITCH_APPS, WM_USER_SWITCH_APPS_CANCEL, WM_USER_SWITCH_APPS_DONE,
-        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_DONE,
+        WM_USER_SWITCH_WINDOWS, WM_USER_SWITCH_WINDOWS_CANCEL, WM_USER_SWITCH_WINDOWS_DONE,
     },
     config::{Hotkey, SWITCH_APPS_HOTKEY_ID, SWITCH_WINDOWS_HOTKEY_ID},
     foreground::IS_FOREGROUND_IN_BLACKLIST,
@@ -16,8 +16,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{SCANCODE_LSHIFT, SCANCODE_RSHIFT},
         WindowsAndMessaging::{
-            CallNextHookEx, SendMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-            KBDLLHOOKSTRUCT, LLKHF_UP, WH_KEYBOARD_LL,
+            CallNextHookEx, GetForegroundWindow, PostMessageW, SetWindowsHookExW,
+            UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_UP, WH_KEYBOARD_LL,
         },
     },
 };
@@ -96,9 +96,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
                 if PREVIOUS_KEYCODE == state.hotkey.code {
                     let id = state.hotkey.id;
                     if id == SWITCH_APPS_HOTKEY_ID {
-                        unsafe { SendMessageW(WINDOW, WM_USER_SWITCH_APPS_DONE, None, None) };
+                        let _ = unsafe { PostMessageW(Some(WINDOW), WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0)) };
                     } else if id == SWITCH_WINDOWS_HOTKEY_ID {
-                        unsafe { SendMessageW(WINDOW, WM_USER_SWITCH_WINDOWS_DONE, None, None) };
+                        let _ = unsafe { PostMessageW(Some(WINDOW), WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0)) };
                     }
                 }
             }
@@ -111,27 +111,36 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
                 if scan_code == state.hotkey.code {
                     let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
                     if id == SWITCH_APPS_HOTKEY_ID {
-                        unsafe {
-                            SendMessageW(WINDOW, WM_USER_SWITCH_APPS, None, Some(LPARAM(reverse)))
+                        let _ = unsafe {
+                            PostMessageW(Some(WINDOW), WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse))
                         };
                         PREVIOUS_KEYCODE = scan_code;
                         return LRESULT(1);
                     } else if id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST {
-                        unsafe {
-                            SendMessageW(
-                                WINDOW,
+                        // Capture foreground window NOW before posting async message
+                        let fg_hwnd = GetForegroundWindow();
+                        let _ = unsafe {
+                            PostMessageW(
+                                Some(WINDOW),
                                 WM_USER_SWITCH_WINDOWS,
-                                None,
-                                Some(LPARAM(reverse)),
+                                WPARAM(fg_hwnd.0 as usize),  // Pass foreground window in WPARAM
+                                LPARAM(reverse),
                             )
                         };
                         PREVIOUS_KEYCODE = scan_code;
                         return LRESULT(1);
                     }
-                } else if scan_code == 0x01 && id == SWITCH_APPS_HOTKEY_ID {
-                    unsafe { SendMessageW(WINDOW, WM_USER_SWITCH_APPS_CANCEL, None, None) };
-                    PREVIOUS_KEYCODE = scan_code;
-                    return LRESULT(1);
+                } else if scan_code == 0x01 {
+                    // ESC key pressed - cancel the current operation
+                    if id == SWITCH_APPS_HOTKEY_ID {
+                        let _ = unsafe { PostMessageW(Some(WINDOW), WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0)) };
+                        PREVIOUS_KEYCODE = scan_code;
+                        return LRESULT(1);
+                    } else if id == SWITCH_WINDOWS_HOTKEY_ID {
+                        let _ = unsafe { PostMessageW(Some(WINDOW), WM_USER_SWITCH_WINDOWS_CANCEL, WPARAM(0), LPARAM(0)) };
+                        PREVIOUS_KEYCODE = scan_code;
+                        return LRESULT(1);
+                    }
                 }
             }
         }
