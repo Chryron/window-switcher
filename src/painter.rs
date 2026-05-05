@@ -516,12 +516,15 @@ impl PreviewCoordinate {
         }
     }
 
-    fn get_item_rect(&self, index: i32, _num_windows: i32) -> RECT {
+    fn get_item_rect(&self, index: i32, num_windows: i32) -> RECT {
         let items_per_row = ((self.width - PREVIEW_PADDING * 2) / self.item_width).max(1);
         let row = index / items_per_row;
         let col = index % items_per_row;
 
-        let left = PREVIEW_PADDING + col * self.item_width + PREVIEW_PADDING;
+        let items_in_this_row = (num_windows - row * items_per_row).min(items_per_row);
+        let center_offset = (items_per_row - items_in_this_row) * self.item_width / 2;
+
+        let left = PREVIEW_PADDING + col * self.item_width + PREVIEW_PADDING + center_offset;
         let top = PREVIEW_PADDING + row * self.item_height + PREVIEW_PADDING;
 
         RECT {
